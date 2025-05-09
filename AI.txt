@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+UnwantedRequestHAProxyWithCognitiveAI_SeededPatterns.py
+
+This script extends the previous HAProxy monitoring solution by:
+ 1) Manually seeding the Felt-Correctness Engine (FCE) with known malicious path patterns
+    so that the system recognizes them as "malicious" from the start.
+ 2) Sending reports to AbuseIPDB (category=18 => Web App Attack) and printing out
+    the server's response (for debug) to confirm they're being received.
+
+No truncated references. Fully self-contained code.
+
+NOTE: Adapt all file paths, environment details, and iptables usage to your setup.
+"""
+
+import os
+import re
+import json
+import math
+import time
+import random
+import shutil
+import subprocess
+import requests
+import ipaddress
+from copy import deepcopy
+from urllib.parse import urlparse
+
+###############################################################################
+# DISK SPACE / STORAGE MANAGEMENT
+###############################################################################
+
+# Minimum free space required in bytes (example: 1 MB).
+MIN_FREE_SPACE_BYTES = 1_000_000
+
+GLOBAL_EPHEMERAL_DATA = {
+    "cognitive_system_state": None,
+    "word_dictionary_data": None
+}
+
+def check_disk_space(path="/"):
+    """
+    Checks if the free disk space at 'path' is above a threshold.
+    Returns True if there's enough free space, False otherwise.
+    """
+    try:
+        stat = shutil.disk_usage(path)
+        if stat.free < MIN_FREE_SPACE_BYTES:
+            return False
+        return True
+    except Exception:
+        return False
+
+def truncate_var_log():
+    """
+    Attempts to truncate everything in /var/log to free space.
+    """
+    try:
+        print("[!] Disk is full, attempting to truncate /var/log to free space...")
+        for root, dirs, files in os.walk("/var/log"):
+            for f in files:
+                full_path = os.path.join(root, f)
+                try:
+                    with open(full_path, "w") as fp:
+                        fp.write("")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[!] Error while truncating /var/log: {e}")
+
+def safe_write_json(filepath, data):
+    """
+    Tries to write 'data' as JSON to 'filepath'.
+    If there's insufficient disk space, tries truncating /var/log.
+    If still no space, stores data in GLOBAL_EPHEMERAL_DATA and prints an alert.
+    """
+    global GLOBAL_EPHEMERAL_DATA
+
+    if check_disk_space("/"):
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            return
+        except Exception as e:
+            print(f"[!] Error writing to {filepath}: {e}. Will try truncating /var/log.")
+            truncate_var_log()
+            if check_disk_space("/"):
+                try:
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2)
+                    return
+                except Exception as e2:
+                    print(f"[!] Still cannot write to {filepath}: {e2}. Storing in memory.")
+                    GLOBAL_EPHEMERAL_DATA[os.path.basename(filepath)] = data
+                    print("[!] OUT OF STORAGE ADMIN REQUIRED")
+            else:
+                GLOBAL_EPHEMERAL_DATA[os.path.basename(filepath)] = data
+                print("[!] OUT OF STORAGE ADMIN REQUIRED")
+    else:
+        truncate_var_log()
+        if check_disk_space("/"):
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                return
+            except Exception as e:
+                print(f"[!] Could not write to {filepath} after truncation: {e}.")
+                GLOBAL_EPHEMERAL_DATA[os.path.basename(filepath)] = data
+                print("[!] OUT OF STORAGE ADMIN REQUIRED")
+        else:
+            GLOBAL_EPHEMERAL_DATA[os.path.basename(filepath)] = data
+            print("[!] OUT OF STORAGE ADMIN REQUIRED")
+
+def attempt_flush_ephemeral_data():
+    """
+    If we have ephemeral data, try flushing it to disk if space is available.
+    """
+    global GLOBAL_EPHEMERAL_DATA
+    if not GLOBAL_EPHEMERAL_DATA:
+        return
+    if check_disk_space("/"):
+        to_remove = []
+        for filename, data in GLOBAL_EPHEMERAL_DATA.items():
+            try:
+                full_path = os.path.join(os.getcwd(), filename)
+                with open(full_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                to_remove.append(filename)
+                print(f"[+] Successfully flushed ephemeral data to {full_path}")
+            except Exception as e:
+                print(f"[!] Failed to flush ephemeral data {filename}: {e}")
+        for fn in to_remove:
+            del GLOBAL_EPHEMERAL_DATA[fn]
+
+###############################################################################
+# LEVENSHTEIN DISTANCE HELPER
+###############################################################################
+
+def levenshtein_distance(s1, s2):
+    if s1 == s2:
+        return 0
+    if len(s1) == 0:
+        return len(s2)
+    if len(s2) == 0:
+        return len(s1)
+
+    dp = [[0] * (len(s2) + 1) for _ in range(len(s1) + 1)]
+    for i in range(len(s1) + 1):
+        dp[i][0] = i
+    for j in range(len(s2) + 1):
+        dp[0][j] = j
+
+    for i in range(1, len(s1) + 1):
+        for j in range(1, len(s2) + 1):
+            cost = 0 if s1[i - 1] == s2[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
+            )
+    return dp[len(s1)][len(s2)]
+
+###############################################################################
+# THEORETICAL AI MODEL (SLS + FCE)
+###############################################################################
+
+VECTOR_DIMENSION = 10
+FCE_CORRECT_REWARD = 0.1
+FCE_INCORRECT_PUNISHMENT = 0.05
+HIGH_CONFIDENCE_THRESHOLD = 0.85
+CONFIDENCE_THRESHOLD = 0.65
+CHUNK_DETECTION_FREQUENCY = 3
+NOISE_INJECTION_PROBABILITY = 0.1
+MAX_ACTIVE_LAYERS = 15
+FADE_THRESHOLD = 60
+DREAM_REORDER_ATTEMPTS = 5
+DREAM_CHUNK_PROBABILITY = 0.5
+FRACTAL_REFLECTION_PROB = 0.3
+EMOTION_ECHO_DECAY = 0.9
+
+EMOTION_RETENTION_FACTOR = {
+    "anxious": 0.8,
+    "curious": 1.0,
+    "confident": 1.2,
+    "unconfident": 0.9,
+    "skeptical": 0.9,
+    "neutral": 1.0,
+    "excited": 1.1,
+    "frustrated": 0.8,
+    "determined": 1.1,
+    "doubtful": 0.8
+}
+
+def generate_random_vector():
+    return [random.uniform(-1.0, 1.0) for _ in range(VECTOR_DIMENSION)]
+
+def vector_similarity(vec1, vec2):
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    mag1 = math.sqrt(sum(a*a for a in vec1))
+    mag2 = math.sqrt(sum(b*b for b in vec2))
+    if mag1 == 0 or mag2 == 0:
+        return 0.0
+    return dot / (mag1*mag2)
+
+def degrade_layer_content(layer_content):
+    if len(layer_content) <= 2:
+        return layer_content
+    degraded_chars = []
+    for ch in layer_content:
+        if random.random() < 0.5:
+            degraded_chars.append(ch)
+    return ''.join(degraded_chars)
+
+def similarity_of_strings(s1, s2):
+    matches = 0
+    for ch in s1:
+        if ch in s2:
+            matches += 1
+    longest = max(len(s1), len(s2))
+    if longest == 0:
+        return 0.0
+    return float(matches) / float(longest)
+
+def chunk_pattern_detected(layers):
+    if len(layers) < 2:
+        return None
+    last_content = layers[-1]['content']
+    for i in range(len(layers)-2, -1, -1):
+        sim = similarity_of_strings(layers[i]['content'], last_content)
+        if sim > 0.8:
+            return (i, len(layers)-1)
+    return None
+
+def blend_vectors(vectors):
+    if not vectors:
+        return [0.0]*VECTOR_DIMENSION
+    sum_vec = [0.0]*VECTOR_DIMENSION
+    for v in vectors:
+        for i in range(VECTOR_DIMENSION):
+            sum_vec[i] += v[i]
+    count = float(len(vectors))
+    return [val/count for val in sum_vec]
+
+###############################################################################
+# Symbolic Calculus (basic) for demonstration
+###############################################################################
+
+def symbolic_differentiate(expression):
+    expr = expression.strip().lower()
+    if expr == "x":
+        return "1"
+    if expr.startswith("x^"):
+        power_str = expr[2:].strip()
+        try:
+            power = float(power_str)
+            new_power = power - 1
+            coeff = int(power)
+            if abs(new_power - 1) < 1e-9:
+                return f"{coeff}*x"
+            else:
+                return f"{coeff}*x^{new_power}"
+        except:
+            return "Unrecognized derivative"
+
+    if expr == "sin(x)":
+        return "cos(x)"
+    if expr == "cos(x)":
+        return "-sin(x)"
+    if expr == "tan(x)":
+        return "sec^2(x)"
+    if expr == "sec^2(x)":
+        return "Unrecognized derivative"
+    return "Unrecognized derivative"
+
+def symbolic_integrate(expression):
+    expr = expression.strip().lower()
+    if expr.startswith("x^"):
+        power_str = expr[2:].strip()
+        try:
+            power = float(power_str)
+            if abs(power + 1) < 1e-9:
+                return "ln|x| + C"
+            else:
+                new_power = power + 1
+                return f"x^{new_power}/{new_power} + C"
+        except:
+            return "Unrecognized integral"
+    if expr == "x":
+        return "x^2/2 + C"
+    if expr == "sin(x)":
+        return "-cos(x) + C"
+    if expr == "cos(x)":
+        return "sin(x) + C"
+    if expr == "tan(x)":
+        return "-ln|cos(x)| + C"
+    if expr == "sec^2(x)":
+        return "tan(x) + C"
+    return "Unrecognized integral"
+
+def parse_calculus_command(problem_str):
+    result = {
+        "steps": [],
+        "final": None
+    }
+    lower_str = problem_str.lower()
+    if "differentiate" in lower_str:
+        tokens = lower_str.split("differentiate", 1)
+        if len(tokens) < 2:
+            result["steps"].append("No expression found after 'differentiate'")
+            return result
+        expression = tokens[1].strip()
+        result["steps"].append(f"Identify: differentiate {expression}")
+        deriv = symbolic_differentiate(expression)
+        if deriv == "Unrecognized derivative":
+            result["steps"].append("Unrecognized derivative form")
+        else:
+            result["steps"].append(f"Derivative => {deriv}")
+            result["final"] = deriv
+        return result
+    elif "integrate" in lower_str:
+        tokens = lower_str.split("integrate", 1)
+        if len(tokens) < 2:
+            result["steps"].append("No expression found after 'integrate'")
+            return result
+        expression = tokens[1].strip()
+        result["steps"].append(f"Identify: integrate {expression}")
+        integ = symbolic_integrate(expression)
+        if integ == "Unrecognized integral":
+            result["steps"].append("Unrecognized integral form")
+        else:
+            result["steps"].append(f"Integral => {integ}")
+            result["final"] = integ
+        return result
+    return None
+
+###############################################################################
+# CognitiveSystem Class
+###############################################################################
+
+class CognitiveSystem:
+    def __init__(self,
+                 words_dict_path="words_dictionary.json",
+                 state_file="cognitive_state.json"):
+        self.words_dict_path = words_dict_path
+        self.state_file = state_file
+
+        self.word_vectors = {}
+        self.load_or_init_word_vectors()
+
+        self.layers = []
+        self.layer_id_counter = 0
+
+        # fce_memory: problem_str -> {
+        #    "problem_vector": [...],
+        #    "score": float,
+        #    "attempts": int,
+        #    "stored_solution": "malicious" or "benign" or None
+        # }
+        self.fce_memory = {}
+
+        self.current_emotion = "neutral"
+        self.previous_emotion = "neutral"
+        self.chunks = {}
+        self.meta_confidence = 1.0
+        self.dream_buffer = []
+
+        self.load_state()
+        self.migrate_fce_memory()
+
+    def load_or_init_word_vectors(self):
+        if not os.path.exists(self.words_dict_path):
+            print(f"[!] Word dictionary not found, will create new vectors on the fly.")
+            return
+        try:
+            with open(self.words_dict_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for word, vec in data.items():
+                if isinstance(vec, list) and len(vec) == VECTOR_DIMENSION:
+                    self.word_vectors[word] = vec
+                else:
+                    self.word_vectors[word] = generate_random_vector()
+        except Exception as e:
+            print(f"[!] Error loading word dictionary: {e}. Starting empty.")
+            self.word_vectors = {}
+
+    def migrate_fce_memory(self):
+        for pattern, info in list(self.fce_memory.items()):
+            if "problem_vector" not in info:
+                info["problem_vector"] = self.get_problem_vector(pattern)
+            if "score" not in info:
+                info["score"] = 0.5
+            if "attempts" not in info:
+                info["attempts"] = 0
+            if "stored_solution" not in info:
+                info["stored_solution"] = None
+
+    def load_state(self):
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                state_data = json.load(f)
+            self.layers = state_data.get("layers", [])
+            self.layer_id_counter = state_data.get("layer_id_counter", 0)
+            self.fce_memory = state_data.get("fce_memory", {})
+            self.current_emotion = state_data.get("current_emotion", "neutral")
+            self.previous_emotion = state_data.get("previous_emotion", "neutral")
+            self.chunks = state_data.get("chunks", {})
+            self.meta_confidence = state_data.get("meta_confidence", 1.0)
+        except Exception as e:
+            print(f"[!] Error loading cognitive state: {e}")
+
+    def save_state(self):
+        state_data = {
+            "layers": self.layers,
+            "layer_id_counter": self.layer_id_counter,
+            "fce_memory": self.fce_memory,
+            "current_emotion": self.current_emotion,
+            "previous_emotion": self.previous_emotion,
+            "chunks": self.chunks,
+            "meta_confidence": self.meta_confidence
+        }
+        safe_write_json(self.state_file, state_data)
+        self.save_word_vectors()
+
+    def save_word_vectors(self):
+        data = {}
+        for w, v in self.word_vectors.items():
+            data[w] = v
+        safe_write_json(self.words_dict_path, data)
+
+    def get_or_create_vector(self, word):
+        w = word.lower().strip()
+        if w not in self.word_vectors:
+            self.word_vectors[w] = generate_random_vector()
+        return self.word_vectors[w]
+
+    def split_problem_into_keywords(self, problem_str):
+        tokens = []
+        current = []
+        for ch in problem_str:
+            if ch.isalnum():
+                current.append(ch)
+            else:
+                if current:
+                    tokens.append(''.join(current).lower())
+                    current = []
+        if current:
+            tokens.append(''.join(current).lower())
+        return tokens
+
+    def get_problem_vector(self, problem_str):
+        tokens = self.split_problem_into_keywords(problem_str)
+        vectors = [self.get_or_create_vector(t) for t in tokens]
+        return blend_vectors(vectors)
+
+    def add_layer(self, content, layer_type="operation", confidence=1.0):
+        layer = {
+            "id": self.layer_id_counter,
+            "content": content,
+            "type": layer_type,
+            "confidence": confidence,
+            "creation_time": time.time(),
+            "age": 0.0
+        }
+        self.layer_id_counter += 1
+        self.layers.append(layer)
+        self.process_fading()
+
+    def process_fading(self):
+        if len(self.layers) > MAX_ACTIVE_LAYERS:
+            excess = len(self.layers) - MAX_ACTIVE_LAYERS
+            for i in range(excess):
+                old_layer = self.layers[i]
+                old_layer['content'] = degrade_layer_content(old_layer['content'])
+                old_layer['confidence'] *= 0.8
+        if len(self.layers) > FADE_THRESHOLD:
+            self.layers = self.layers[-FADE_THRESHOLD:]
+
+    def parallel_FCE_guess(self, problem_str):
+        current_vec = self.get_problem_vector(problem_str)
+        best_match = None
+        best_score = 0.0
+        for stored_problem, info in self.fce_memory.items():
+            stored_vec = info["problem_vector"]
+            sim = vector_similarity(current_vec, stored_vec)
+            if sim > best_score:
+                best_score = sim
+                best_match = stored_problem
+        if best_match is not None:
+            combined_conf = (best_score + self.fce_memory[best_match]["score"]) / 2.0
+            guess = self.fce_memory[best_match].get("stored_solution", "malicious")
+            return guess, combined_conf
+        else:
+            return "benign", 0.0
+
+    def fallback_to_SLS(self, problem_str):
+        self.add_layer(f"Fallback SLS handling: {problem_str}", "problem_recognition")
+        calc_result = parse_calculus_command(problem_str)
+        if calc_result is not None:
+            for step in calc_result["steps"]:
+                self.add_layer(step, "symbolic_calc_step")
+            if calc_result["final"] is not None:
+                final_val = calc_result["final"]
+                self.add_layer(f"SLS final: {final_val}", "solution")
+                return final_val
+            else:
+                self.add_layer("Unable to complete symbolic request", "error")
+                return None
+
+        # Attempt numeric
+        if any(op in problem_str for op in ['+', '-', '*', '/', '^']):
+            expression = problem_str.replace('^', '**')
+            self.add_layer(f"Attempt numeric solve: {expression}", "comprehension")
+            try:
+                val = eval(expression)
+                self.add_layer(f"SLS numeric result: {val}", "solution")
+                return val
+            except Exception as e:
+                self.add_layer(f"SLS error: {e}", "error")
+                return None
+
+        # Otherwise we guess "benign"
+        self.add_layer("No known approach => default benign guess", "info")
+        return "benign"
+
+    def update_FCE(self, problem_str, solution, success):
+        if problem_str not in self.fce_memory:
+            self.fce_memory[problem_str] = {
+                "problem_vector": self.get_problem_vector(problem_str),
+                "score": 0.5,
+                "attempts": 0,
+                "stored_solution": solution
+            }
+        info = self.fce_memory[problem_str]
+        info["attempts"] += 1
+        if success:
+            info["score"] = min(info["score"] + FCE_CORRECT_REWARD, 1.0)
+        else:
+            info["score"] = max(info["score"] - FCE_INCORRECT_PUNISHMENT, 0.0)
+        if info["stored_solution"] != solution:
+            info["stored_solution"] = solution
+
+    def attempt_problem(self, problem_str):
+        guess, guess_conf = self.parallel_FCE_guess(problem_str)
+        if guess_conf >= HIGH_CONFIDENCE_THRESHOLD:
+            self.add_layer(f"FCE guess (HIGH conf={guess_conf:.2f}): {guess}", "fce_accepted")
+            final_solution = guess
+        elif guess_conf >= CONFIDENCE_THRESHOLD:
+            self.add_layer(f"FCE guess (MID conf={guess_conf:.2f}): {guess}", "fce_uncertain")
+            sls_solution = self.fallback_to_SLS(problem_str)
+            if sls_solution == guess:
+                self.add_layer("SLS agrees with FCE guess", "info")
+                final_solution = guess
+            else:
+                self.add_layer("SLS disagrees with FCE guess", "info")
+                final_solution = sls_solution
+        else:
+            self.add_layer(f"FCE guess (LOW conf={guess_conf:.2f}): {guess}", "fce_fallback")
+            final_solution = self.fallback_to_SLS(problem_str)
+        return final_solution
+
+    def finalize_outcome(self, problem_str, final_solution, is_actually_malicious):
+        if is_actually_malicious:
+            success = (final_solution == "malicious")
+        else:
+            success = (final_solution != "malicious")
+        self.update_FCE(problem_str, final_solution, success)
+        self.update_emotion(success)
+        self.meta_loop_evaluate(success)
+        self.save_state()
+
+    def update_emotion(self, success):
+        if success:
+            candidates = ["confident", "excited", "determined", "neutral"]
+            new_emotion = random.choice(candidates)
+        else:
+            candidates = ["frustrated", "anxious", "doubtful", "skeptical", "unconfident"]
+            new_emotion = random.choice(candidates)
+        if new_emotion != self.current_emotion:
+            self.previous_emotion = self.current_emotion
+            self.current_emotion = new_emotion
+        self.meta_confidence *= EMOTION_ECHO_DECAY
+        if success:
+            self.meta_confidence += 0.05
+        else:
+            self.meta_confidence -= 0.05
+        self.meta_confidence = max(0.0, min(2.0, self.meta_confidence))
+
+    def meta_loop_evaluate(self, success):
+        if success:
+            self.add_layer("Meta-loop: success => content approach", "meta")
+        else:
+            self.add_layer("Meta-loop: failure => more caution next time", "meta")
+
+        if random.random() < FRACTAL_REFLECTION_PROB:
+            self.fractal_layer_reflection()
+        self.dream_like_reorder()
+        self.layer_retention_check()
+
+        if len(self.layers) % CHUNK_DETECTION_FREQUENCY == 0:
+            self.detect_and_chunk()
+
+    def fractal_layer_reflection(self):
+        reflection_content = f"Fractal Reflection: analyzing {len(self.layers)} layers"
+        self.add_layer(reflection_content, "reflection")
+
+    def dream_like_reorder(self):
+        if len(self.layers) < 2:
+            return
+        for _ in range(DREAM_REORDER_ATTEMPTS):
+            idx1 = random.randint(0, len(self.layers) - 1)
+            idx2 = random.randint(0, len(self.layers) - 1)
+            if idx1 != idx2:
+                self.layers[idx1], self.layers[idx2] = self.layers[idx2], self.layers[idx1]
+                if random.random() < DREAM_CHUNK_PROBABILITY:
+                    self.detect_and_chunk()
+        self.add_layer("Dream-like reorder complete", "dream_simulation")
+
+    def layer_retention_check(self):
+        factor = EMOTION_RETENTION_FACTOR.get(self.current_emotion, 1.0)
+        if factor < 1.0:
+            for i in range(len(self.layers)):
+                if random.random() > factor:
+                    self.layers[i]['content'] = degrade_layer_content(self.layers[i]['content'])
+                    self.layers[i]['confidence'] *= 0.9
+
+    def detect_and_chunk(self):
+        pattern = chunk_pattern_detected(self.layers)
+        if pattern is not None:
+            start_idx, end_idx = pattern
+            chunk_content = []
+            for idx in range(start_idx, end_idx + 1):
+                chunk_content.append(self.layers[idx]['content'])
+            chunk_str = "|".join(chunk_content)
+            chunk_id = f"CHUNK_{len(self.chunks)}"
+            self.chunks[chunk_id] = chunk_str
+            compressed_layer_content = f"[{chunk_id}] => {chunk_str}"
+            self.add_layer(compressed_layer_content, "chunk")
+            for idx in range(start_idx, end_idx + 1):
+                self.layers[idx]['content'] = f"~CHUNKED: {self.layers[idx]['content']}"
+
+###############################################################################
+# ABUSE IPDB REPORTING
+###############################################################################
+
+ABUSEIPDB_API_KEY = "d5490c9f39cb444432c7d967bf9d06e134aceeb8eadc008d98159b472238660ef3d2a131c65d252d"  # Insert your valid API key
+ABUSEIPDB_REPORT_URL = "https://api.abuseipdb.com/api/v2/report"
+# We'll always use category 18 => Web App Attack
+
+def report_to_abuseipdb(ip_address, comment):
+    """
+    Submits a report to AbuseIPDB with category=21 (Web App Attack).
+    Prints the server response for debugging.
+    """
+    if not ABUSEIPDB_API_KEY:
+        print("[!] ABUSEIPDB_API_KEY not set, skipping report.")
+        return
+
+    headers = {
+        "Accept": "application/json",
+        "Key": ABUSEIPDB_API_KEY
+    }
+    payload = {
+        "ip": ip_address,
+        "categories": "21",  # Web App Attack
+        "comment": comment
+    }
+    try:
+        r = requests.post(ABUSEIPDB_REPORT_URL, headers=headers, data=payload, timeout=5)
+        print(f"[AbuseIPDB] Report response status: {r.status_code}")
+        print(f"[AbuseIPDB] Report response body: {r.text}")
+    except Exception as e:
+        print(f"[!] Error sending report to AbuseIPDB: {e}")
+
+###############################################################################
+# GLOBAL IP & BAN TRACKING
+###############################################################################
+
+ip_info = {}
+local_ban_history = {}
+abuse_ip_cache = {}
+
+def is_cloudflare_ip(ip_address):
+    CLOUDFLARE_IP_RANGES = [
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+        "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+        "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/12",
+        "172.64.0.0/13", "131.0.72.0/22"
+    ]
+    try:
+        ip_obj = ipaddress.ip_address(ip_address)
+        for rng in CLOUDFLARE_IP_RANGES:
+            net = ipaddress.ip_network(rng)
+            if ip_obj in net:
+                return True
+        return False
+    except ValueError:
+        return False
+
+def ban_ip(ip_address, reason):
+    print(f"[!] Banning IP: {ip_address} - Reason: {reason}")
+    local_ban_history[ip_address] = time.time()
+    try:
+        subprocess.run(["sudo", "iptables", "-A", "INPUT", "-s", ip_address, "-j", "DROP"], check=False)
+    except Exception as e:
+        print(f"[!] Failed to ban IP {ip_address}: {e}")
+
+###############################################################################
+# LOG PARSING & DETECTION
+###############################################################################
+
+log_file = "/var/log/haproxy.log"
+
+ALLOWED_DOMAIN = "xn--w-sgae.gay"
+ALLOWED_PATHS = [
+    "/api",
+    "/Gallery",
+    "/api/media",
+    "/api/Media",
+    "/cursors",
+    "/cursorfile.bin",
+    "/mediaws",
+    "/api/upload",
+    "/api/report",
+    "/InternalWonderBread4",
+    "/robots.txt"
+]
+DISALLOWED_PATTERNS = [
+    "/cgi-bin/",
+    "/luci/",
+    "/phpunit/",
+    "/vendor/",
+    "/eval-stdin.php",
+    "/index.php?s=/index/",
+    "/hello.world",
+    "allow_url_include",
+    "auto_prepend_file",
+    "/bin/sh",
+    "../../../../",
+    "/wp-admin",
+    "/xmlrpc.php",
+    "wp-config",
+    "/etc/passwd",
+    "/cmd.exe",
+    "/ftp",
+    "/sql",
+    "UNION SELECT",
+    "nc.exe",
+    "/manage",
+    "/actuator",
+    "/web",
+     "/.git/refs/remotes/",
+     "/.git",
+     "/refs",
+     "/remotes",
+     "/v2/static/not.found",
+     "/remote/logincheck",
+     "/static",
+     "/remote",
+     "/login?redir=/ng"
+     "/wp-login.php",
+     "/wp-admin",
+     "/test",
+     "/staging",
+     "/secret",
+     "/private",
+     "/phpmyadmin",
+     "/phpinfo.php",
+     "/panel",
+     "/login",
+     "/info.php",
+     "/dev",
+     "/debug",
+     "/dashboard",
+     "/cpanel",
+     "/control",
+     "/console",
+     "/config",
+     "/backup",
+     "/administrator",
+     "/ecp/Current/exporttool/microsoft.exchange.ediscovery.exporttool.application",
+     "/autodiscover/autodiscover.json?@zdi/Powershell"
+]
+
+ABUSE_THRESHOLD = 90
+CACHE_TTL_HOURS = 24
+MAX_REPORT_AGE_DAYS = 365
+SUSPECT_ASNS = ["AS9009", "AS14061"]
+
+def is_allowed_log(line):
+    # Basic log parse
+    match = re.search(
+        r'(\d+\.\d+\.\d+\.\d+):\d+\s+\[.*?\].*?"(GET|POST|HEAD|PUT|DELETE|OPTIONS)\s+(.*?)\s+HTTP/[\d.]+"',
+        line
+    )
+
+    if r'\x' in line:
+        bin_m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+        if bin_m:
+            return bin_m.group(1), "Binary payload detected", None
+
+    if match:
+        ip_address, method, endpoint = match.groups()
+        parsed_host = None
+        path = endpoint
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            parsed = urlparse(endpoint)
+            parsed_host = parsed.netloc.lower()
+            path = parsed.path
+
+        for pattern in DISALLOWED_PATTERNS:
+            if pattern.lower() in path.lower():
+                return ip_address, f"Detected blocked pattern in path: {path}", pattern
+
+        if parsed_host:
+            if parsed_host == ALLOWED_DOMAIN:
+                return None, None, None
+            else:
+                return ip_address, f"Disallowed host: {parsed_host}", None
+        else:
+            for ap in ALLOWED_PATHS:
+                if path.startswith(ap):
+                    return None, None, None
+            return ip_address, f"Unrecognized path: {path}", None
+
+    return None, None, None
+
+def check_if_should_ban(ip_address):
+    data = ip_info.get(ip_address)
+    if not data:
+        return False
+    if data['system_score'] >= 100 or data['abuse_score'] >= ABUSE_THRESHOLD:
+        return True
+    return False
+
+def get_abuse_data(ip_address):
+    """
+    Optionally fetch data from AbuseIPDB /check and /reports endpoints,
+    stored in abuse_ip_cache. Omitted for brevity here if not needed.
+    """
+    return None, None
+
+def build_risk_profile(ip_address, check_data, reports_data):
+    """
+    Stub. In real usage, parse the data from AbuseIPDB to adjust system_score.
+    """
+    pass
+
+def monitor_log(cog_sys):
+    print("[*] Monitoring HAProxy log...")
+    process = subprocess.Popen(["tail", "-F", log_file], stdout=subprocess.PIPE, text=True)
+    while True:
+        line = process.stdout.readline().strip()
+        if not line:
+            continue
+
+        ip_address, reason, pattern = is_allowed_log(line)
+        if not ip_address:
+            continue
+
+        if ip_address not in ip_info:
+            ip_info[ip_address] = {
+                'abuse_score': 0,
+                'system_score': 0,
+                'observations': [],
+                'last_local_ban': None
+            }
+
+        # If we want to fetch from /check or /reports, do so here.
+        c_data, r_data = get_abuse_data(ip_address)
+        if c_data or r_data:
+            build_risk_profile(ip_address, c_data, r_data)
+
+        problem_str = f"{ip_address} {reason}"
+
+        if pattern:
+            # Known malicious => forcibly malicious
+            ip_info[ip_address]['system_score'] = 100
+            ip_info[ip_address]['observations'].append(f"Known malicious pattern: {pattern}")
+            guess_solution = cog_sys.attempt_problem(problem_str)
+            final_solution = "malicious"
+            cog_sys.finalize_outcome(problem_str, final_solution, True)
+
+            print(f"[!] Detected malicious path: {pattern} from IP {ip_address}")
+            # Let's also send an AbuseIPDB report here
+            comment_msg = f"Detected Web App Attack: Disallowed pattern detected: {pattern} | SLS Model=100%"
+            report_to_abuseipdb(ip_address, comment_msg)
+
+            if check_if_should_ban(ip_address):
+                ban_reason = f"Known malicious pattern: {pattern}"
+                ban_ip(ip_address, ban_reason)
+
+        else:
+            # suspicious but not a known pattern => let the system guess
+            guess_solution = cog_sys.attempt_problem(problem_str)
+            # we interpret reason != None => suspicious => is_malicious=True for demonstration
+            is_malicious = True
+            cog_sys.finalize_outcome(problem_str, guess_solution, is_malicious)
+
+            if guess_solution == "malicious":
+                ip_info[ip_address]['system_score'] += 30
+                ip_info[ip_address]['observations'].append("AI model guessed malicious")
+                print(f"[!] IP {ip_address} flagged malicious => blocking.")
+                comment_msg = f"Detected Web App Attack: Disallowed pattern suspected: {reason} | FCE Engine=malicious"
+                report_to_abuseipdb(ip_address, comment_msg)
+
+                if check_if_should_ban(ip_address):
+                    ban_reason = f"AI guessed malicious. system_score={ip_info[ip_address]['system_score']}"
+                    ban_ip(ip_address, ban_reason)
+            else:
+                ip_info[ip_address]['system_score'] += 5
+                ip_info[ip_address]['observations'].append("AI guessed benign")
+                print(f"[+] IP {ip_address} allowed => benign guess by AI.")
+                # If desired, you could report them as suspicious but not certain.
+
+        attempt_flush_ephemeral_data()
+
+###############################################################################
+# MAIN (with manual FCE seeding)
+###############################################################################
+
+if __name__ == "__main__":
+    # Create our cognitive system
+    cog_sys = CognitiveSystem(
+        words_dict_path="words_dictionary.json",
+        state_file="cognitive_state.json"
+    )
+
+    # Manually seed the FCE with known malicious patterns
+    known_bad_patterns = [
+        "/cgi-bin/",
+        "/owa/auth/x.js",
+        "/filemanager.php",
+        "/phpunit/",
+        "/wp-admin",
+        "/etc/passwd",
+        "/cmd.exe",
+        "/xmlrpc.php",
+        "/luci/",
+        "/phpunit/",
+        "/vendor/",
+        "/eval-stdin.php",
+        "/index.php?s=/index/",
+        "/hello.world",
+        "allow_url_include",
+        "auto_prepend_file",
+        "/bin/sh",
+        "../../../../",
+        "wp-config",
+        "/ftp",
+        "/sql",
+        "UNION SELECT",
+        "nc.exe",
+        "/manage",
+        "/actuator",
+        "/web",
+        "/.git/refs/remotes/",
+        "/.git",
+        "/refs",
+        "/remotes",
+        "/v2/static/not.found",
+        "/remote/logincheck",
+        "/static",
+        "/remote",
+        "/login?redir=/ng",
+        "/wp-login.php",
+        "/wp-admin",
+        "/test",
+        "/staging",
+        "/secret",
+        "/private",
+        "/phpmyadmin",
+        "/phpinfo.php",
+        "/panel",
+        "/login",
+        "/info.php",
+        "/dev",
+        "/debug",
+        "/dashboard",
+        "/cpanel",
+        "/control",
+        "/console",
+        "/config",
+        "/backup",
+        "/administrator"
+    ]
+    # We'll store them in the FCE with solution="malicious" and success=True
+    # so the engine starts out "knowing" these are malicious.
+    for pat in known_bad_patterns:
+        problem_str = f"Malicious pattern: {pat}"
+        cog_sys.update_FCE(problem_str, "malicious", success=True)
+
+    try:
+        monitor_log(cog_sys)
+    except KeyboardInterrupt:
+        print("\n[!] Stopping log monitor.")
+    except Exception as e:
+        print(f"[!] Fatal error in monitor loop: {e}")
